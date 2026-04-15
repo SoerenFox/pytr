@@ -8,7 +8,7 @@ This is a very slightly reengineered version of the [pytr](https://github.com/py
 ## Installation
 
 ```bash
-pip install git+https://github.com/SoerenFox/pytr-Modified-.git
+pip install git+https://github.com/SoerenFox/pytr.git
 ```
 
 If the command `pytr` is not recognized after installation, add this to your PATH:

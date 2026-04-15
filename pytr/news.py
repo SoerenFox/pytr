@@ -35,7 +35,7 @@ class News:
                 if (int(time()) - article["createdAt"] / 1000 > timedelta(days=14).total_seconds()):
                     continue
                 if not sent:
-                    print(f"News for {pos["name"]}.")
+                    print(f"News for {pos['name']}.")
                     sent = True
                 print("\tHeadline:\t", article["headline"])
                 print("\tPublication:\t", date.fromtimestamp(article["createdAt"] / 1000).strftime("%A, %d. %B %Y"))

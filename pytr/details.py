@@ -50,6 +50,7 @@ class Details:
                 print(f"unmatched subscription of type '{subscription['type']}':\n{preview(response, num_lines=30)}")
 
             if recv == 6:
+                await self.tr.close()
                 return
 
     def print_instrument(self):
@@ -87,6 +88,6 @@ class Details:
         self.stock_details()
 
     def get(self):
-        asyncio.get_event_loop().run_until_complete(self.details_loop())
+        asyncio.run(self.details_loop())
 
         self.overview()

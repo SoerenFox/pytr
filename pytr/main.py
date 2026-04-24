@@ -5,6 +5,7 @@ import asyncio
 import json
 import shutil
 import signal
+import sys
 from datetime import datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
@@ -16,10 +17,11 @@ from pytr.alarms import Alarms
 from pytr.details import Details
 from pytr.dl import DL
 from pytr.event import Event
-from pytr.portfolio import Portfolio
 from pytr.stoploss import StopLossUpdater
 from pytr.orderOverview import OrderOverview
 from pytr.news import News
+from pytr.portfolio import PORTFOLIO_COLUMNS, Portfolio
+from pytr.timeline import Timeline
 from pytr.transactions import SUPPORTED_LANGUAGES, TransactionExporter
 from pytr.utils import check_version, get_logger
 
@@ -67,18 +69,23 @@ def get_main_parser():
     parser_cmd = parser.add_subparsers(help="Desired action to perform", dest="command")
 
     # help
-    parser_cmd.add_parser(
+    parser_help = parser_cmd.add_parser(
         "help",
         help="Print this help message",
         description="Print help message",
         add_help=False,
     )
+    parser_help.add_argument("--for-readme", action="store_true", help=argparse.SUPPRESS)
 
     # parent subparser with common login arguments
     parser_login_args = argparse.ArgumentParser(add_help=False)
-    parser_login_args.add_argument("--applogin", help="Use app login instead of  web login", action="store_true")
     parser_login_args.add_argument("-n", "--phone_no", help="TradeRepublic phone number (international format)")
     parser_login_args.add_argument("-p", "--pin", help="TradeRepublic pin")
+    parser_login_args.add_argument(
+        "--waf-token",
+        help='AWS WAF token value or the method to obtain it. Values: "playwright", "awswaf" or a token string, e.g. an aws-waf-token cookie captured from a browser session.',
+        default="playwright",
+    )
     parser_login_args.add_argument(
         "--store_credentials",
         help="Store credentials (Phone number, pin, cookies) for next usage",
@@ -136,6 +143,47 @@ def get_main_parser():
         description=info,
     )
 
+    # portfolio
+    info = "Show current portfolio"
+    parser_portfolio = parser_cmd.add_parser(
+        "portfolio",
+        formatter_class=formatter,
+        parents=[parser_login_args, parser_lang, parser_decimal_localization],
+        help=info,
+        description=info,
+    )
+    parser_portfolio.add_argument(
+        "--include-watchlist",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include watchlist.",
+    )
+    parser_portfolio.add_argument("-o", "--output", help="Output path of CSV file", type=Path)
+    parser_portfolio.add_argument(
+        "--sort-by-column",
+        type=str.lower,
+        choices=[col.lower() for col in PORTFOLIO_COLUMNS],
+        default=None,
+        help="Sort results by column.",
+    )
+    parser_portfolio.add_argument(
+        "--sort-ascending",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to sort in ascending order.",
+    )
+
+    # details
+    info = "Get details for an ISIN"
+    parser_details = parser_cmd.add_parser(
+        "details",
+        formatter_class=formatter,
+        parents=[parser_login_args],
+        help=info,
+        description=info,
+    )
+    parser_details.add_argument("isin", help="ISIN of intrument")
+
     # dl_docs
     info = (
         "Download all pdf documents from the timeline and sort them into folders."
@@ -165,7 +213,14 @@ def get_main_parser():
     )
     parser_dl_docs.add_argument(
         "--last_days",
-        help="Number of last days to include (use 0 get all days)",
+        help="Include data from the last N days (0 = include all days, -1 = no update)",
+        metavar="DAYS",
+        default=0,
+        type=int,
+    )
+    parser_dl_docs.add_argument(
+        "--days_until",
+        help="Include data up to N days ago (0 = include all days)",
         metavar="DAYS",
         default=0,
         type=int,
@@ -178,34 +233,112 @@ def get_main_parser():
     )
     parser_dl_docs.add_argument("--universal", help="Platform independent file names", action="store_true")
     parser_dl_docs.add_argument(
+        "--store-event-database",
+        default=True,
+        help="Write and maintain an event database file (all_events.json)",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_dl_docs.add_argument(
+        "--scan-for-duplicates",
+        default=False,
+        help="Scan for duplicate events",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_dl_docs.add_argument(
+        "--dump-raw-data",
+        default=False,
+        help="Dump more raw data in json format",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_dl_docs.add_argument(
+        "--export-transactions",
+        default=True,
+        help="Export transactions into a file, e.g. as csv into account_transactions.csv",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_dl_docs.add_argument(
         "--export-format",
         choices=("json", "csv"),
         default="csv",
-        help="The output file format.",
+        help="The output file format for the transaction export",
+    )
+    parser_dl_docs.add_argument(
+        "--flat",
+        default=False,
+        help="Do not sort documents into folders and keep their original filenames",
+        action="store_true",
     )
 
-    # portfolio
-    info = "Show current portfolio"
-    parser_portfolio = parser_cmd.add_parser(
-        "portfolio",
+    # export_transactions
+    info = (
+        "Read data from the TR timeline and export transactions into a file, e.g. as csv into account_transactions.csv."
+    )
+    parser_export_transactions = parser_cmd.add_parser(
+        "export_transactions",
         formatter_class=formatter,
-        parents=[parser_login_args],
+        parents=[
+            parser_login_args,
+            parser_lang,
+            parser_date_with_time,
+            parser_decimal_localization,
+            parser_sort_export,
+        ],
         help=info,
         description=info,
     )
-    parser_portfolio.add_argument("-o", "--output", help="Output path of CSV file", type=Path)
-
-    # details
-    info = "Get details for an ISIN"
-    parser_details = parser_cmd.add_parser(
-        "details",
-        formatter_class=formatter,
-        parents=[parser_login_args],
-        help=info,
-        description=info,
+    parser_export_transactions.add_argument(
+        "--last_days",
+        help="Include data from the last N days (0 = include all days, -1 = no update)",
+        metavar="DAYS",
+        default=0,
+        type=int,
     )
-    parser_details.add_argument("isin", help="ISIN of intrument")
-
+    parser_export_transactions.add_argument(
+        "--days_until",
+        help="Include data up to N days ago (0 = include all days)",
+        metavar="DAYS",
+        default=0,
+        type=int,
+    )
+    parser_export_transactions.add_argument(
+        "--store-event-database",
+        default=True,
+        help="Write and maintain an event database file (all_events.json)",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_export_transactions.add_argument(
+        "--scan-for-duplicates",
+        default=False,
+        help="Scan for duplicate events",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_export_transactions.add_argument(
+        "--dump-raw-data",
+        default=False,
+        help="Dump more raw data in json format",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser_export_transactions.add_argument(
+        "--export-format",
+        "--format",
+        choices=("json", "csv"),
+        default="csv",
+        help="The output file format for the transaction export",
+    )
+    parser_export_transactions.add_argument(
+        "--outputdir",
+        help="Output directory",
+        metavar="PATH",
+        type=Path,
+        default=Path("."),
+    )
+    parser_export_transactions.add_argument(
+        "outputfile",
+        help="Output file path (optional)",
+        type=argparse.FileType("w", encoding="utf-8"),
+        nargs="?",
+    )
+    
     # savings_plans
     info = "Show savings plans overview"
     parser_savings = parser_cmd.add_parser(
@@ -468,34 +601,6 @@ def get_main_parser():
         nargs="?",
     )
 
-    # export_transactions
-    info = "Create a CSV with the deposits and removals ready for importing into Portfolio Performance"
-    parser_export_transactions = parser_cmd.add_parser(
-        "export_transactions",
-        formatter_class=formatter,
-        parents=[parser_lang, parser_date_with_time, parser_decimal_localization, parser_sort_export],
-        help=info,
-        description=info,
-    )
-    parser_export_transactions.add_argument(
-        "input",
-        help="Input path to JSON (use all_events.json from dl_docs)",
-        type=argparse.FileType("r", encoding="utf-8"),
-    )
-    parser_export_transactions.add_argument(
-        "output",
-        help="Output file path",
-        type=argparse.FileType("w", encoding="utf-8"),
-        default="-",
-        nargs="?",
-    )
-    parser_export_transactions.add_argument(
-        "--format",
-        choices=("json", "csv"),
-        default="csv",
-        help="The output file format.",
-    )
-
     info = "Print shell tab completion"
     parser_completion = parser_cmd.add_parser(
         "completion",
@@ -515,12 +620,11 @@ def exit_gracefully(signum, frame):
 
     try:
         if input("\nReally quit? (y/n)> ").lower().startswith("y"):
-            exit(1)
+            sys.exit(1)
 
     except KeyboardInterrupt:
         print("Ok ok, quitting")
-        exit(1)
-
+        sys.exit(1)
     # restore the exit gracefully handler here
     signal.signal(signal.SIGINT, exit_gracefully)
 
@@ -539,29 +643,70 @@ def main():
     if args.verbosity.upper() == "DEBUG":
         log.debug("logging is set to debug")
 
+    # Compute the timestamp range to get data for
+    not_before = 0
+    if hasattr(args, "last_days"):
+        if args.last_days < 0:
+            not_before = float(-1)
+        elif args.last_days == 0:
+            not_before = float(0)
+        else:
+            not_before = (datetime.now().astimezone() - timedelta(days=args.last_days)).timestamp()
+    not_after = (
+        (datetime.now().astimezone() - timedelta(days=args.days_until)).timestamp()
+        if hasattr(args, "days_until") and args.days_until > 0
+        else float("inf")
+    )
+
     if args.command == "login":
         login(
             phone_no=args.phone_no,
             pin=args.pin,
-            web=not args.applogin,
             store_credentials=args.store_credentials,
+            waf_token=args.waf_token,
         )
-
-    elif args.command == "dl_docs":
-        if args.last_days == 0:
-            since_timestamp = 0
-        else:
-            since_timestamp = (datetime.now().astimezone() - timedelta(days=args.last_days)).timestamp()
-        dl = DL(
+    elif args.command == "portfolio":
+        p = Portfolio(
             login(
                 phone_no=args.phone_no,
                 pin=args.pin,
-                web=not args.applogin,
                 store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            ),
+            args.include_watchlist,
+            lang=args.lang,
+            decimal_localization=args.decimal_localization,
+            output=args.output,
+            sort_by_column=args.sort_by_column,
+            sort_descending=not args.sort_ascending,
+        )
+        p.get()
+    elif args.command == "details":
+        Details(
+            login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            ),
+            args.isin,
+        ).get()
+    elif args.command == "dl_docs":
+        DL(
+            login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
             ),
             args.output,
             args.format,
-            since_timestamp=since_timestamp,
+            not_before,
+            not_after,
+            args.store_event_database,
+            args.scan_for_duplicates,
+            args.dump_raw_data,
+            args.export_transactions,
             max_workers=args.workers,
             universal_filepath=args.universal,
             lang=args.lang,
@@ -569,16 +714,53 @@ def main():
             decimal_localization=args.decimal_localization,
             sort_export=args.sort,
             format_export=args.export_format,
+            flat=args.flat,
+        ).do_dl()
+    elif args.command == "export_transactions":
+        if args.outputfile is None and args.outputdir is None:
+            print("No output argument given.")
+            return -1
+
+        tl = Timeline(
+            login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            ),
+            args.outputdir,
+            not_before,
+            not_after,
+            args.store_event_database,
+            args.scan_for_duplicates,
+            args.dump_raw_data,
         )
-        asyncio.get_event_loop().run_until_complete(dl.dl_loop())
+        asyncio.run(tl.tl_loop())
+        events = tl.events
+
+        with (
+            (args.outputdir / ("account_transactions." + args.export_format)).open("w", encoding="utf-8")
+            if args.outputfile is None
+            else args.outputfile as f
+        ):
+            TransactionExporter(
+                lang=args.lang,
+                date_with_time=args.date_with_time,
+                decimal_localization=args.decimal_localization,
+            ).export(
+                f,
+                [Event.from_dict(item) for item in events],
+                sort=args.sort,
+                format=args.export_format,
+            )
     elif args.command == "get_price_alarms":
         try:
             Alarms(
                 login(
                     phone_no=args.phone_no,
                     pin=args.pin,
-                    web=not args.applogin,
                     store_credentials=args.store_credentials,
+                    waf_token=args.waf_token,
                 ),
                 args.input,
                 args.outputfile,
@@ -588,7 +770,12 @@ def main():
             return -1
     elif args.command == "compact_portfolio":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_compact_portfolio()
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -596,7 +783,12 @@ def main():
             return -1
     elif args.command == "portfolio_status":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_portfolio_status()
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -604,7 +796,12 @@ def main():
             return -1
     elif args.command == "watchlist":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_watchlist()
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -612,7 +809,12 @@ def main():
             return -1
     elif args.command == "cash":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_cash()
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -620,7 +822,12 @@ def main():
             return -1
     elif args.command == "ticker":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_ticker(args.isin, exchange=args.exchange)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -628,7 +835,12 @@ def main():
             return -1
     elif args.command == "performance":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_performance(args.isin, exchange=args.exchange)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -636,7 +848,12 @@ def main():
             return -1
     elif args.command == "timeline":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             if args.after:
                 res = tr.blocking_timeline(after=args.after)
             else:
@@ -647,7 +864,12 @@ def main():
             return -1
     elif args.command == "timeline_detail":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_timeline_detail(args.id)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -655,7 +877,12 @@ def main():
             return -1
     elif args.command == "search_suggested_tags":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_search_suggested_tags(args.query)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -663,7 +890,12 @@ def main():
             return -1
     elif args.command == "search":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_search(args.query, asset_type=args.asset_type)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -675,7 +907,6 @@ def main():
                 login(
                     phone_no=args.phone_no,
                     pin=args.pin,
-                    web=not args.applogin,
                     store_credentials=args.store_credentials,
                 )
             ).get()
@@ -684,7 +915,12 @@ def main():
             return -1
     elif args.command == "price_for_order":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_price_for_order(args.isin, args.exchange, args.order_type)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -696,7 +932,6 @@ def main():
                 login(
                     phone_no=args.phone_no,
                     pin=args.pin,
-                    web=not args.applogin,
                     store_credentials=args.store_credentials,
                 )
             ).update(percent_diff=args.percent / 100, expiry=args.expiry, expiry_date=args.expiry_date)
@@ -705,7 +940,12 @@ def main():
             return -1
     elif args.command == "limit_order":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             warnings = args.warnings_shown.split(",") if args.warnings_shown else None
             res = tr.blocking_limit_order(
                 args.isin,
@@ -723,7 +963,12 @@ def main():
             return -1
     elif args.command == "cancel_order":
         try:
-            tr = login(phone_no=args.phone_no, pin=args.pin, web=not args.applogin, store_credentials=args.store_credentials)
+            tr =  login(
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
+                waf_token=args.waf_token,
+            )
             res = tr.blocking_cancel_order(args.order_id)
             print(json.dumps(res, indent=2, ensure_ascii=False))
         except ValueError as e:
@@ -735,7 +980,6 @@ def main():
                 login(
                     phone_no=args.phone_no,
                     pin=args.pin,
-                    web=not args.applogin,
                     store_credentials=args.store_credentials,
                 )
             ).get(args.isin)
@@ -746,10 +990,9 @@ def main():
         try:
             News(
                 login(
-                    phone_no=args.phone_no,
-                    pin=args.pin,
-                    web=not args.applogin,
-                    store_credentials=args.store_credentials,
+                phone_no=args.phone_no,
+                pin=args.pin,
+                store_credentials=args.store_credentials,
                 )
             ).get_for_portfolio()
         except ValueError as e:
@@ -761,8 +1004,8 @@ def main():
                 login(
                     phone_no=args.phone_no,
                     pin=args.pin,
-                    web=not args.applogin,
                     store_credentials=args.store_credentials,
+                    waf_token=args.waf_token,
                 ),
                 args.input,
                 args.inputfile,
@@ -771,22 +1014,11 @@ def main():
         except ValueError as e:
             print(e)
             return -1
-    elif args.command == "details":
-        Details(
-            login(
-                phone_no=args.phone_no,
-                pin=args.pin,
-                web=not args.applogin,
-                store_credentials=args.store_credentials,
-            ),
-            args.isin,
-        ).get()
     elif args.command == "savings_plans":
         try:
             tr = login(
                 phone_no=args.phone_no,
                 pin=args.pin,
-                web=not args.applogin,
                 store_credentials=args.store_credentials,
             )
             # use the blocking helper generated by __getattr__ (blocking_savings_plan_overview)
@@ -795,35 +1027,15 @@ def main():
         except ValueError as e:
             print(e)
             return -1
-    elif args.command == "portfolio":
-        p = Portfolio(
-            login(
-                phone_no=args.phone_no,
-                pin=args.pin,
-                web=not args.applogin,
-                store_credentials=args.store_credentials,
-            )
-        )
-        p.get()
-        if args.output is not None:
-            p.portfolio_to_csv(args.output)
-    elif args.command == "export_transactions":
-        events = [Event.from_dict(item) for item in json.load(args.input)]
-        TransactionExporter(
-            lang=args.lang,
-            date_with_time=args.date_with_time,
-            decimal_localization=args.decimal_localization,
-        ).export(
-            fp=args.output,
-            events=events,
-            sort=args.sort,
-            format=args.format,
-        )
     elif args.version:
         installed_version = version("pytr")
         print(installed_version)
         check_version(installed_version)
     else:
+        if hasattr(args, "for_readme") and args.for_readme:
+            parser.formatter_class = lambda prog: argparse.ArgumentDefaultsHelpFormatter(
+                "pytr", max_help_position=40, width=120
+            )
         parser.print_help()
 
 

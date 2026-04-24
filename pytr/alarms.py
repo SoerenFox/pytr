@@ -44,6 +44,9 @@ class Alarms:
                 return
 
     async def set_alarms(self):
+        # get current alarms
+        await self.alarms_loop()
+
         current_alarms = {}
         new_alarms = {}
         alarms_to_keep = {}
@@ -98,6 +101,7 @@ class Alarms:
         while action_count > 0:
             await self.tr.recv()
             action_count -= 1
+        await self.tr.close()
         return
 
     def overview(self):
@@ -132,6 +136,7 @@ class Alarms:
             writer.writerows(
                 [alarms_dict_from_alarms_row(key, value, max_values) for key, value in alarms_per_ISIN.items()]
             )
+            self.fp.close()
 
     def get(self):
         cur_isin = None
@@ -147,7 +152,11 @@ class Alarms:
                 except InvalidOperation:
                     raise ValueError(f"{token} is no valid ISIN or decimal value that could represent an alarm.")
 
-        asyncio.get_event_loop().run_until_complete(self.alarms_loop())
+        async def get_alarms_and_close():
+            await self.alarms_loop()
+            await self.tr.close()
+
+        asyncio.run(get_alarms_and_close())
 
         self.overview()
 
@@ -178,8 +187,5 @@ class Alarms:
                     if value is not None and value != "":
                         bisect.insort(self.data[isin], Decimal(value.replace(",", "")))
 
-        # get current alarms
-        asyncio.get_event_loop().run_until_complete(self.alarms_loop())
-
         # set/remove alarms
-        asyncio.get_event_loop().run_until_complete(self.set_alarms())
+        asyncio.run(self.set_alarms())
